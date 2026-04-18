@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import threading
 
 from common import middleware, message_protocol, fruit_item
@@ -13,8 +14,10 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+
 class SumFilter:
     def __init__(self):
+        self._prev_sigterm_handler = signal.signal(signal.SIGTERM, self.handle_sigterm)
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
@@ -46,7 +49,6 @@ class SumFilter:
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(message_protocol.internal.serialize([]))
 
-
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 2:
@@ -57,6 +59,12 @@ class SumFilter:
 
     def start(self):
         self.input_queue.start_consuming(self.process_data_messsage)
+
+    def handle_sigterm(self, signum, frame):
+        logging.info("Recieved SIGTERM")
+        self.input_queue.stop_consuming()
+        self.input_queue.close()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
