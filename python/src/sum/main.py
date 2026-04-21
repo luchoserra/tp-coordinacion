@@ -1,6 +1,7 @@
 import os
 import logging
 import signal
+import hashlib
 import threading
 
 from common import middleware, message_protocol, fruit_item
@@ -43,6 +44,9 @@ class SumFilter:
         self.input_queue.stop_consuming()
         self.eof_input.stop_consuming()
 
+    def _get_aggregator_index(self, fruit):
+        return int(hashlib.md5(fruit.encode()).hexdigest(), 16) % AGGREGATION_AMOUNT
+
     def _process_data(self, client_id, fruit, amount):
         with self.lock:
             client_fruits = self.fruit_amounts_by_client.setdefault(client_id, {})
@@ -56,10 +60,10 @@ class SumFilter:
 
         logging.info(f"Flushing results for client {client_id}")
         for fi in fruit_amounts.values():
-            for exchange in self.data_output_exchanges:
-                exchange.send(
-                    message_protocol.internal.serialize([client_id, fi.fruit, fi.amount])
-                )
+            idx = self._get_aggregator_index(fi.fruit)
+            self.data_output_exchanges[idx].send(
+                message_protocol.internal.serialize([client_id, fi.fruit, fi.amount])
+            )
         for exchange in self.data_output_exchanges:
             exchange.send(message_protocol.internal.serialize([client_id]))
 
