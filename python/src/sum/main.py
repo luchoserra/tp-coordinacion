@@ -16,78 +16,96 @@ AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
 
 class SumFilter:
+
     def __init__(self):
-        self._prev_sigterm_handler = signal.signal(signal.SIGTERM, self.handle_sigterm)
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
+        self.eof_broadcast = None
+        self.eof_input = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_CONTROL_EXCHANGE}_{ID}"]
+        )
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
+            self.data_output_exchanges.append(
+                middleware.MessageMiddlewareExchangeRabbitMQ(
+                    MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
+                )
             )
-            self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
-        self.processed_eofs = set()
+
+        self.fruit_amounts_by_client = {}
+        self.lock = threading.Lock()
+
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("SIGTERM received")
+        self.input_queue.stop_consuming()
+        self.eof_input.stop_consuming()
 
     def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Process data")
-        client_fruits = self.amount_by_fruit.setdefault(client_id, {})
-        client_fruits[fruit] = client_fruits.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+        with self.lock:
+            client_fruits = self.fruit_amounts_by_client.setdefault(client_id, {})
+            client_fruits[fruit] = client_fruits.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self, client_id, propagate=False):
-        logging.info(f"Propagating EOF to other Sum instances")
+    def _flush_client(self, client_id):
+        with self.lock:
+            fruit_amounts = self.fruit_amounts_by_client.pop(client_id, {})
 
-        if client_id in self.processed_eofs:
-            if propagate:
-                self.input_queue.send(
-                    message_protocol.internal.serialize([client_id, True])
+        logging.info(f"Flushing results for client {client_id}")
+        for fi in fruit_amounts.values():
+            for exchange in self.data_output_exchanges:
+                exchange.send(
+                    message_protocol.internal.serialize([client_id, fi.fruit, fi.amount])
                 )
-            return
-        self.processed_eofs.add(client_id)
+        for exchange in self.data_output_exchanges:
+            exchange.send(message_protocol.internal.serialize([client_id]))
 
-        if propagate:
-            for _ in range(SUM_AMOUNT - 1):
-                self.input_queue.send(
-                    message_protocol.internal.serialize([client_id, True])
+    def process_data_message(self, message, ack, nack):
+        try:
+            fields = message_protocol.internal.deserialize(message)
+            if len(fields) == 3:
+                self._process_data(*fields)
+            else:
+                client_id = fields[0]
+                self.eof_broadcast.send(
+                    message_protocol.internal.serialize([client_id])
                 )
+            ack()
+        except Exception:
+            nack()
+            raise
 
-        logging.info(f"Sending data to Aggregators")
-        for final_fruit_item in self.amount_by_fruit.get(client_id, {}).values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
+    def process_eof_message(self, message, ack, nack):
+        try:
+            fields = message_protocol.internal.deserialize(message)
+            client_id = fields[0]
+            self._flush_client(client_id)
+            ack()
+        except Exception:
+            nack()
+            raise
 
-        logging.info(f"Sending EOF to Aggregators")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
-
-        self.amount_by_fruit.pop(client_id, None)
-
-    def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
-            self._process_data(*fields)
-        elif len(fields) == 1:
-            self._process_eof(*fields, True)
-        else:
-            self._process_eof(fields[0], False)
-        ack()
+    def _data_thread(self):
+        self.eof_broadcast = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
+            [f"{SUM_CONTROL_EXCHANGE}_{i}" for i in range(SUM_AMOUNT)],
+        )
+        self.input_queue.start_consuming(self.process_data_message)
+        self.input_queue.close()
+        self.eof_broadcast.close()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.close()
-
-    def handle_sigterm(self, signum, frame):
-        logging.info("Recieved SIGTERM")
-        self.input_queue.stop_consuming()
-        self.input_queue.close()
+        t = threading.Thread(target=self._data_thread)
+        t.start()
+        self.eof_input.start_consuming(self.process_eof_message)
+        self.eof_input.close()
+        t.join()
+        for exchange in self.data_output_exchanges:
+            exchange.close()
 
 
 def main():
