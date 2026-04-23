@@ -29,6 +29,7 @@ class JoinFilter:
         self.clients_top_count = {}
 
     def process_messsage(self, message, ack, nack):
+        """Accumulates a partial top and sends the final top-N once all aggregators have reported."""
         logging.info("Received top")
         client_id, partial_fruit_top = message_protocol.internal.deserialize(message)
         self.clients_top_fruit[client_id] = (
@@ -51,10 +52,12 @@ class JoinFilter:
             raise
 
     def handle_sigterm(self, signum, frame):
+        """Stops the consumer gracefully on SIGTERM."""
         logging.info("Received SIGTERM")
         self.input_queue.stop_consuming()
 
     def start(self):
+        """Starts consuming messages and closes all connections when done."""
         self.input_queue.start_consuming(self.process_messsage)
         self.input_queue.close()
         self.output_queue.close()

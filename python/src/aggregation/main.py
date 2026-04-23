@@ -30,6 +30,7 @@ class AggregationFilter:
         self.clients_eof_count = {}
 
     def _process_data(self, client_id, fruit, amount):
+        """Inserts or updates a fruit entry in the sorted top for this client."""
         logging.info("Processing data message")
         fruit_top = self.clients_fruit_top.setdefault(client_id, [])
         for i in range(len(fruit_top)):
@@ -37,9 +38,10 @@ class AggregationFilter:
                 old = fruit_top.pop(i)
                 bisect.insort(fruit_top, old + fruit_item.FruitItem(fruit, amount))
                 return
-        bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))  # fruta nueva
+        bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 
     def _process_eof(self, client_id):
+        """Counts EOFs from Sum instances and sends the top-N result once all have arrived."""
         logging.info("Received EOF")
         self.clients_eof_count[client_id] = self.clients_eof_count.get(client_id, 0) + 1
         if self.clients_eof_count[client_id] == SUM_AMOUNT:
@@ -58,7 +60,8 @@ class AggregationFilter:
             del self.clients_fruit_top[client_id]
             del self.clients_eof_count[client_id]
 
-    def process_messsage(self, message, ack, nack):
+    def process_message(self, message, ack, nack):
+        """Dispatches an incoming message to data or EOF handling based on its field count."""
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
@@ -68,10 +71,12 @@ class AggregationFilter:
         ack()
 
     def handle_sigterm(self, signum, frame):
+        """Stops the consumer gracefully on SIGTERM."""
         logging.info("Received SIGTERM")
         self.input_exchange.stop_consuming()
 
     def start(self):
+        """Starts consuming messages and closes all connections when done."""
         self.input_exchange.start_consuming(self.process_messsage)
         self.input_exchange.close()
         self.output_queue.close()

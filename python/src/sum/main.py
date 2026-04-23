@@ -40,9 +40,9 @@ class SumFilter:
             for i in range(AGGREGATION_AMOUNT)
         ]
 
-        self.fruit_totals = {}
-        self.local_count = {}
-        self.expected_total = {}
+        self.partial_sums = {}
+        self.record_count = {}
+        self.expected_count = {}
         self.reported = {}
 
         self.lock = threading.Lock()
@@ -50,27 +50,32 @@ class SumFilter:
         signal.signal(signal.SIGTERM, self._handle_sigterm)
 
     def _handle_sigterm(self, signum, frame):
+        """Stops all consumers gracefully on SIGTERM."""
         logging.info("SIGTERM received")
         self.input_queue.stop_consuming()
         self.control_input.stop_consuming()
 
     def _aggregator_for(self, fruit):
+        """Returns the aggregator index responsible for this fruit name."""
         return int(hashlib.md5(fruit.encode()).hexdigest(), 16) % AGGREGATION_AMOUNT
 
     def _broadcast(self, payload):
+        """Sends a control message to all sum instances via the control exchange."""
         self.control_output.send(message_protocol.internal.serialize(payload))
 
     def _record_fruit(self, client_id, fruit, amount):
-        client_fruits = self.fruit_totals.setdefault(client_id, {})
+        """Accumulates amount into the running total for this client and fruit."""
+        client_fruits = self.partial_sums.setdefault(client_id, {})
         client_fruits[fruit] = client_fruits.get(
             fruit, fruit_item.FruitItem(fruit, 0)
         ) + fruit_item.FruitItem(fruit, int(amount))
-        self.local_count[client_id] = self.local_count.get(client_id, 0) + 1
+        self.record_count[client_id] = self.record_count.get(client_id, 0) + 1
 
     def _flush(self, client_id):
-        fruits = self.fruit_totals.pop(client_id, {})
-        self.local_count.pop(client_id, None)
-        self.expected_total.pop(client_id, None)
+        """Sends accumulated totals to the aggregators and clears all state for the client."""
+        fruits = self.partial_sums.pop(client_id, {})
+        self.record_count.pop(client_id, None)
+        self.expected_count.pop(client_id, None)
         self.reported.pop(client_id, None)
 
         logging.info(f"Flushing results for client {client_id}")
@@ -82,25 +87,27 @@ class SumFilter:
             exchange.send(message_protocol.internal.serialize([client_id]))
 
     def _try_flush(self, client_id):
-        if client_id not in self.expected_total:
+        """Flushes the client if all instances have reported and counts are consistent."""
+        if client_id not in self.expected_count:
             return
         reported = self.reported.get(client_id, {})
         if len(reported) < SUM_AMOUNT:
             return
-        if sum(reported.values()) != self.expected_total[client_id]:
+        if sum(reported.values()) != self.expected_count[client_id]:
             return
         self._flush(client_id)
 
     def process_data_message(self, message, ack, nack):
+        """Handles an incoming data message: records a fruit item or initiates a pre-flush."""
         try:
             fields = message_protocol.internal.deserialize(message)
             with self.lock:
                 if len(fields) == 3:
                     client_id, fruit, amount = fields
                     self._record_fruit(client_id, fruit, amount)
-                    if client_id in self.expected_total:
+                    if client_id in self.expected_count:
                         self._broadcast(
-                            [COUNT, client_id, ID, self.local_count[client_id]]
+                            [COUNT, client_id, ID, self.record_count[client_id]]
                         )
                 else:
                     client_id, total = fields
@@ -111,15 +118,16 @@ class SumFilter:
             raise
 
     def process_control_message(self, message, ack, nack):
+        """Handles a control message: coordinates count reporting and triggers flush when ready."""
         try:
             fields = message_protocol.internal.deserialize(message)
             tag = fields[0]
             with self.lock:
                 if tag == PREFLUSH:
                     _, client_id, total = fields
-                    self.expected_total[client_id] = total
+                    self.expected_count[client_id] = total
                     self._broadcast(
-                        [COUNT, client_id, ID, self.local_count.get(client_id, 0)]
+                        [COUNT, client_id, ID, self.record_count.get(client_id, 0)]
                     )
                 elif tag == COUNT:
                     _, client_id, sender_id, count = fields
@@ -132,6 +140,7 @@ class SumFilter:
             raise
 
     def start(self):
+        """Starts data and control consumers in parallel, then closes all connections."""
         data_thread = threading.Thread(
             target=self.input_queue.start_consuming,
             args=(self.process_data_message,),
