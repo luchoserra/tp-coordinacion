@@ -77,7 +77,7 @@ class AggregationFilter:
 
     def start(self):
         """Starts consuming messages and closes all connections when done."""
-        self.input_exchange.start_consuming(self.process_messsage)
+        self.input_exchange.start_consuming(self.process_message)
         self.input_exchange.close()
         self.output_queue.close()
 
